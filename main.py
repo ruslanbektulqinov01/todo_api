@@ -2,33 +2,27 @@ from fastapi import FastAPI, Depends, HTTPException, status, Form, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, ForeignKey, desc
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy.orm import sessionmaker, relationship, Session
 from passlib.context import CryptContext
 from starlette.middleware.sessions import SessionMiddleware
-from sqlalchemy.orm import Session
 from pydantic import BaseModel
+from typing import Optional
 
 app = FastAPI()
 
-# === Config ===
-
 SQLALCHEMY_DATABASE_URL = "sqlite:///./todo.db"
 
-# === Database setup ===
-
-engine = create_engine(SQLALCHEMY_DATABASE_URL)
+engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-
-# === Models ===
 
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True)
     hashed_password = Column(String)
-    tasks = relationship("Task", back_populates="owner")
+    tasks = relationship("Task", back_populates="owner", cascade="all, delete-orphan")
 
 
 class Task(Base):
@@ -43,18 +37,23 @@ class Task(Base):
 Base.metadata.create_all(bind=engine)
 
 
-# === Pydantic Models (for request/response validation) ===
-
 class TaskCreate(BaseModel):
     content: str
 
 
 class TaskUpdate(BaseModel):
-    content: str | None = None
-    completed: bool | None = None
+    content: Optional[str] = None
+    completed: Optional[bool] = None
 
 
-# === Dependencies ===
+class TaskResponse(BaseModel):
+    id: int
+    content: str
+    completed: bool
+
+    class Config:
+        from_attributes = True
+
 
 def get_db():
     db = SessionLocal()
@@ -74,18 +73,11 @@ def get_current_user(request: Request, db: Session = Depends(get_db)):
     return user
 
 
-# === Password hashing ===
-
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# === Middleware ===
-
-app.add_middleware(SessionMiddleware, secret_key="your_secret_key")
+app.add_middleware(SessionMiddleware, secret_key="123456789")
 
 
-# === Routes ===
-
-# Register a new user
 @app.post("/register")
 async def register(username: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
     if db.query(User).filter(User.username == username).first():
@@ -97,7 +89,6 @@ async def register(username: str = Form(...), password: str = Form(...), db: Ses
     return {"message": "User registered successfully"}
 
 
-# Login
 @app.post("/login")
 async def login(request: Request, username: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
     user = db.query(User).filter(User.username == username).first()
@@ -107,32 +98,28 @@ async def login(request: Request, username: str = Form(...), password: str = For
     return {"message": "Login successful"}
 
 
-# Logout
 @app.get("/logout")
 async def logout(request: Request):
     request.session.clear()
     return {"message": "Logout successful"}
 
 
-# Get all tasks for the current user
-@app.get("/tasks")
+@app.get("/tasks", response_model=list[TaskResponse])
 async def get_tasks(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     tasks = db.query(Task).filter(Task.owner_id == user.id).order_by(Task.completed, desc(Task.id)).all()
-    return {"tasks": tasks}
+    return tasks
 
 
-# Add a new task for the current user
-@app.post("/tasks")
+@app.post("/tasks", response_model=TaskResponse)
 async def add_task(task: TaskCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     new_task = Task(content=task.content, owner_id=user.id)
     db.add(new_task)
     db.commit()
     db.refresh(new_task)
-    return {"success": True, "task": new_task}
+    return new_task
 
 
-# Update a task
-@app.put("/tasks/{task_id}")
+@app.put("/tasks/{task_id}", response_model=TaskResponse)
 async def update_task(
         task_id: int,
         task_update: TaskUpdate,
@@ -143,16 +130,14 @@ async def update_task(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    if task_update.content is not None:
-        task.content = task_update.content
-    if task_update.completed is not None:
-        task.completed = task_update.completed
+    for key, value in task_update.dict(exclude_unset=True).items():
+        setattr(task, key, value)
 
     db.commit()
-    return {"success": True, "task": task}
+    db.refresh(task)
+    return task
 
 
-# Delete a task
 @app.delete("/tasks/{task_id}")
 async def delete_task(task_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     task = db.query(Task).filter(Task.id == task_id, Task.owner_id == user.id).first()
@@ -160,7 +145,7 @@ async def delete_task(task_id: int, user: User = Depends(get_current_user), db: 
         raise HTTPException(status_code=404, detail="Task not found")
     db.delete(task)
     db.commit()
-    return {"success": True}
+    return {"message": "Task deleted successfully"}
 
 
 if __name__ == "__main__":
