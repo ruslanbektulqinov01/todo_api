@@ -1,18 +1,18 @@
 from fastapi import FastAPI, Depends, HTTPException, status, Form, Request
-from fastapi.responses import JSONResponse
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, ForeignKey, desc
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship, Session
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, select, desc
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from passlib.context import CryptContext
 from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from typing import List, Optional
 
 app = FastAPI()
 
-SQLALCHEMY_DATABASE_URL = "postgresql://todo_admin:postgres@localhost/todo_db"
-engine = create_engine(SQLALCHEMY_DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+SQLALCHEMY_DATABASE_URL = "postgresql+asyncpg://todo_admin:postgres@localhost/todo_db"
+
+engine = create_async_engine(SQLALCHEMY_DATABASE_URL)
+AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
 
 
@@ -33,9 +33,6 @@ class Task(Base):
     owner = relationship("User", back_populates="tasks")
 
 
-Base.metadata.create_all(bind=engine)
-
-
 class TaskCreate(BaseModel):
     content: str
 
@@ -51,22 +48,20 @@ class TaskResponse(BaseModel):
     completed: bool
 
     class Config:
-        from_attributes = True
+        from_orm = True
 
 
-def get_db():
-    db = SessionLocal()
-    try:
+async def get_db():
+    async with AsyncSessionLocal() as db:
         yield db
-    finally:
-        db.close()
 
 
-def get_current_user(request: Request, db: Session = Depends(get_db)):
+async def get_current_user(request: Request, db: AsyncSession = Depends(get_db)):
     username = request.session.get("username")
     if not username:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
-    user = db.query(User).filter(User.username == username).first()
+    result = await db.execute(select(User).filter(User.username == username))
+    user = result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     return user
@@ -74,23 +69,27 @@ def get_current_user(request: Request, db: Session = Depends(get_db)):
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-app.add_middleware(SessionMiddleware, secret_key="123456789")
+app.add_middleware(SessionMiddleware, secret_key="your_secret_key")
 
 
 @app.post("/register")
-async def register(username: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
-    if db.query(User).filter(User.username == username).first():
+async def register(username: str = Form(...), password: str = Form(...), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(User).filter(User.username == username))
+    existing_user = result.scalar_one_or_none()
+    if existing_user:
         raise HTTPException(status_code=400, detail="Username already taken")
     hashed_password = pwd_context.hash(password)
-    user = User(username=username, hashed_password=hashed_password)
-    db.add(user)
-    db.commit()
+    new_user = User(username=username, hashed_password=hashed_password)
+    db.add(new_user)
+    await db.commit()
     return {"message": "User registered successfully"}
 
 
 @app.post("/login")
-async def login(request: Request, username: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.username == username).first()
+async def login(request: Request, username: str = Form(...), password: str = Form(...),
+                db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(User).filter(User.username == username))
+    user = result.scalar_one_or_none()
     if not user or not pwd_context.verify(password, user.hashed_password):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect username or password")
     request.session["username"] = username
@@ -103,18 +102,19 @@ async def logout(request: Request):
     return {"message": "Logout successful"}
 
 
-@app.get("/tasks", response_model=list[TaskResponse])
-async def get_tasks(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    tasks = db.query(Task).filter(Task.owner_id == user.id).order_by(Task.completed, desc(Task.id)).all()
+@app.get("/tasks", response_model=List[TaskResponse])
+async def get_tasks(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Task).filter(Task.owner_id == user.id).order_by(Task.completed, desc(Task.id)))
+    tasks = result.scalars().all()
     return tasks
 
 
 @app.post("/tasks", response_model=TaskResponse)
-async def add_task(task: TaskCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+async def add_task(task: TaskCreate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     new_task = Task(content=task.content, owner_id=user.id)
     db.add(new_task)
-    db.commit()
-    db.refresh(new_task)
+    await db.commit()
+    await db.refresh(new_task)
     return new_task
 
 
@@ -123,27 +123,29 @@ async def update_task(
         task_id: int,
         task_update: TaskUpdate,
         user: User = Depends(get_current_user),
-        db: Session = Depends(get_db)
+        db: AsyncSession = Depends(get_db)
 ):
-    task = db.query(Task).filter(Task.id == task_id, Task.owner_id == user.id).first()
+    result = await db.execute(select(Task).filter(Task.id == task_id, Task.owner_id == user.id))
+    task = result.scalar_one_or_none()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
     for key, value in task_update.dict(exclude_unset=True).items():
         setattr(task, key, value)
 
-    db.commit()
-    db.refresh(task)
+    await db.commit()
+    await db.refresh(task)
     return task
 
 
 @app.delete("/tasks/{task_id}")
-async def delete_task(task_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    task = db.query(Task).filter(Task.id == task_id, Task.owner_id == user.id).first()
+async def delete_task(task_id: int, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Task).filter(Task.id == task_id, Task.owner_id == user.id))
+    task = result.scalar_one_or_none()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    db.delete(task)
-    db.commit()
+    await db.delete(task)
+    await db.commit()
     return {"message": "Task deleted successfully"}
 
 
